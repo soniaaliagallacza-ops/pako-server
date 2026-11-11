@@ -167,7 +167,8 @@ async def recibir_mensaje(request: Request):
             return {"status": "ok"}
         lead = await buscar_lead_en_notion(telefono_lead)
         respuesta = generar_respuesta_pako(texto_lead, lead)
-        await enviar_whatsapp(telefono_lead, respuesta)
+        status_envio, resultado_envio = await enviar_whatsapp(telefono_lead, respuesta)
+        print(f"Envio WhatsApp a ...{telefono_lead[-4:]}: {status_envio} {resultado_envio}")
         if lead.get("notion_id"):
             await actualizar_lead_notion(lead["notion_id"], "En seguimiento", f"[PAKO: '{texto_lead[:80]}']")
     except Exception as e:
