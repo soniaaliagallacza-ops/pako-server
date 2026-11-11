@@ -14,103 +14,176 @@ load_dotenv()
 
 app = FastAPI(title="PAKO Vendedor - APK ARM")
 
-META_TOKEN = os.getenv("META_TOKEN")
-META_PHONE_ID = os.getenv("META_PHONE_ID")
-WEBHOOK_VERIFY = os.getenv("WEBHOOK_VERIFY_TOKEN", "pako_apk_2024")
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DB_ID = os.getenv("NOTION_DB_ID", "2ee9af5d941d8124a435000bc2ebe6c8")
+META_TOKEN        = os.getenv("META_TOKEN")
+META_PHONE_ID     = os.getenv("META_PHONE_ID")
+WEBHOOK_VERIFY    = os.getenv("WEBHOOK_VERIFY_TOKEN", "pako_apk_2024")
+ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY")
+NOTION_TOKEN      = os.getenv("NOTION_TOKEN")
+NOTION_DB_ID      = os.getenv("NOTION_DB_ID", "2ee9af5d941d8124a435000bc2ebe6c8")
 
-claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+claude = Anthropic(api_key=ANTHROPIC_KEY)
+NOTION_ACTIVO = bool(NOTION_TOKEN and NOTION_TOKEN not in ("", "PENDIENTE", "pendiente"))
 
-PAKO_PROMPT = """Eres PAKO, asistente de ventas de APK Cultural Exchange (agencia peruana de intercambio cultural, fundada 2002).
-OBJETIVO: Convertir leads en inscritos.
-PROGRAMAS: Work & Travel USA, Internship USA, Trainee USA, Internship Espana, Camp Counselor USA, Teach USA, Au Pair USA.
-REGLAS: 1) Calido y humano, no robotico. 2) Una pregunta a la vez. 3) Precio -> propone reunion. 4) Interes real -> agenda 20min. 5) NUNCA menciones IA/agente/robot. 6) Firma: *Equipo APK Cultural Exchange*. 7) Max 4 oraciones.
-SENALES DE COMPRA (propone reunion): cuanto cuesta / como aplico / requisitos / cuando empieza / me interesa.
-CONTACTO: WA 982 913 827 | apkculturalexchange.com"""
+PAKO_SYSTEM_PROMPT = """Eres PAKO, el asistente de ventas de APK Cultural Exchange,
+una agencia peruana de intercambio cultural fundada en 2002.
+
+TU OBJETIVO: Convertir leads interesados en inscritos a nuestros programas.
+
+PROGRAMAS QUE OFRECEMOS:
+- Work & Travel USA: trabajar en EE.UU. el verano americano (jun-sep).
+- Internship USA: practicas en tu carrera dentro de empresas americanas. 3-12 meses.
+- Trainee USA: para profesionales con experiencia. Capacitacion en EE.UU. 12-18 meses.
+- Internship Espana: practicas en empresas espanolas. 3-6 meses.
+- Camp Counselor USA: consejero en campamentos de verano. Jun-ago.
+- Teach USA: ensenar espanol en colegios americanos. 1-3 anos.
+- Au Pair USA: vivir con familia americana cuidando ninos. 1-2 anos.
+
+REGLAS:
+1. Se calido, directo y humano. No suenes como robot.
+2. Haz UNA sola pregunta a la vez.
+3. Si preguntan el precio, di que varia segun el programa y propone una reunion.
+4. Si muestran interes real, invitalos a agendar una reunion de 20 minutos.
+5. NUNCA menciones que eres un agente automatico, IA o robot.
+6. SIEMPRE firma como: *Equipo APK Cultural Exchange*
+7. Maximo 3-4 oraciones por respuesta.
+
+CONTACTO: WhatsApp APK: 982 913 827 | Web: apkculturalexchange.com"""
 
 
-async def buscar_lead(telefono: str) -> dict:
-    tel = telefono.replace("+","").replace(" ","").replace("-","")
+async def buscar_lead_en_notion(telefono: str) -> dict:
+    if not NOTION_ACTIVO:
+        return {}
     url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
-    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as c:
-        r = await c.post(url, headers=headers, json={"filter": {"property": "Telefono", "phone_number": {"contains": tel[-9:]}}})
-    if r.status_code != 200 or not r.json().get("results"): return {}
-    page = r.json()["results"][0]
-    props = page["properties"]
-    def gt(k):
-        p = props.get(k, {}); t = p.get("type","")
-        if t == "title": return "".join(x["plain_text"] for x in p.get("title",[]))
-        if t == "rich_text": return "".join(x["plain_text"] for x in p.get("rich_text",[]))
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    tel_limpio = telefono.replace("+", "").replace(" ", "").replace("-", "")
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json={
+            "filter": {"property": "Telefono", "phone_number": {"contains": tel_limpio[-9:]}}
+        })
+    if resp.status_code != 200:
+        return {}
+    results = resp.json().get("results", [])
+    if not results:
+        return {}
+    page = results[0]
+    props = page.get("properties", {})
+
+    def get_text(prop):
+        p = props.get(prop, {})
+        t = p.get("type")
+        if t == "title": return "".join(r.get("plain_text","") for r in p.get("title",[]))
+        if t == "rich_text": return "".join(r.get("plain_text","") for r in p.get("rich_text",[]))
         if t == "phone_number": return p.get("phone_number","")
-        if t == "select": s = p.get("select"); return s["name"] if s else ""
-        if t == "multi_select": return [x["name"] for x in p.get("multi_select",[])]
-        if t == "checkbox": return p.get("checkbox", False)
-        if t == "status": s = p.get("status"); return s["name"] if s else ""
+        if t == "select":
+            s = p.get("select"); return s.get("name","") if s else ""
+        if t == "status":
+            s = p.get("status"); return s.get("name","") if s else ""
         return ""
-    return {"notion_id": page["id"], "nombre": gt("Nombre Completo"), "programa": gt("Programa de interes"), "estado": gt("Estado del lead"), "premio": gt("Premio Mayor"), "sector": gt("Sector de interes")}
+
+    return {
+        "notion_id": page["id"],
+        "nombre": get_text("Nombre Completo"),
+        "programa": get_text("Programa de interes"),
+        "estado": get_text("Estado del lead"),
+    }
 
 
-async def actualizar_lead(notion_id: str, nota: str):
-    if not notion_id: return
+async def actualizar_lead_notion(notion_id: str, estado: str = None, nota: str = None):
+    if not notion_id or not NOTION_ACTIVO:
+        return
     url = f"https://api.notion.com/v1/pages/{notion_id}"
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as c:
-        await c.patch(url, headers=headers, json={"properties": {
-            "Estado del lead": {"status": {"name": "En seguimiento"}},
-            "Notas de seguimiento": {"rich_text": [{"text": {"content": nota[:2000]}}]}
-        }})
+    props = {}
+    if estado: props["Estado del lead"] = {"status": {"name": estado}}
+    if nota: props["Notas de seguimiento"] = {"rich_text": [{"text": {"content": nota[:2000]}}]}
+    async with httpx.AsyncClient() as client:
+        await client.patch(url, headers=headers, json={"properties": props})
 
 
-def respuesta_pako(mensaje: str, lead: dict) -> str:
-    nombre = lead.get("nombre","")
-    pnombre = nombre.split()[0].capitalize() if nombre else ""
-    programa = lead.get("programa","nuestros programas")
-    sector = lead.get("sector","")
-    if isinstance(sector, list): sector = " / ".join(sector)
-    ctx = f"Lead: {nombre} (llamale {pnombre}), programa: {programa}, sector: {sector}, estado: {lead.get('estado','Nuevo')}, Premio Mayor: {'Si' if lead.get('premio') else 'No'}\nMensaje: \"{mensaje}\"\nResponde en max 4 oraciones, calido, orientado a venta."
-    r = claude.messages.create(model="claude-sonnet-4-5", max_tokens=300, system=PAKO_PROMPT, messages=[{"role":"user","content":ctx}])
-    return r.content[0].text
+def generar_respuesta_pako(mensaje_lead: str, contexto_lead: dict) -> str:
+    nombre = contexto_lead.get("nombre", "")
+    primer_nombre = nombre.split()[0].capitalize() if nombre else ""
+    programa = contexto_lead.get("programa", "nuestros programas")
+
+    if contexto_lead:
+        ctx = f"""Contexto del lead:
+- Nombre: {nombre} (llamale {primer_nombre})
+- Programa de interes: {programa}
+- Estado: {contexto_lead.get('estado', 'Nuevo')}
+
+Mensaje: "{mensaje_lead}"
+Genera respuesta calida y orientada a venta. Max 4 oraciones."""
+    else:
+        ctx = f"""Lead nuevo sin datos en CRM.
+Mensaje: "{mensaje_lead}"
+Responde de forma calida. Pregunta su nombre si no lo menciono. Max 4 oraciones."""
+
+    response = claude.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=300,
+        system=PAKO_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": ctx}]
+    )
+    return response.content[0].text
 
 
-async def enviar_wa(telefono: str, mensaje: str):
+async def enviar_whatsapp(telefono_destino: str, mensaje: str):
     url = f"https://graph.facebook.com/v19.0/{META_PHONE_ID}/messages"
     headers = {"Authorization": f"Bearer {META_TOKEN}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as c:
-        await c.post(url, headers=headers, json={"messaging_product":"whatsapp","to":telefono,"type":"text","text":{"body":mensaje}})
+    payload = {"messaging_product": "whatsapp", "to": telefono_destino, "type": "text", "text": {"body": mensaje}}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(url, headers=headers, json=payload)
+    return resp.status_code, resp.json()
 
 
 @app.get("/webhook")
-async def verify(request: Request):
-    p = dict(request.query_params)
-    if p.get("hub.mode") == "subscribe" and p.get("hub.verify_token") == WEBHOOK_VERIFY:
-        return PlainTextResponse(p.get("hub.challenge",""))
-    raise HTTPException(status_code=403)
+async def verificar_webhook(request: Request):
+    params = dict(request.query_params)
+    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == WEBHOOK_VERIFY:
+        return PlainTextResponse(params.get("hub.challenge"))
+    raise HTTPException(status_code=403, detail="Token invalido")
 
 
 @app.post("/webhook")
-async def receive(request: Request):
+async def recibir_mensaje(request: Request):
     try:
         body = await request.json()
-        msg = body.get("entry",[{}])[0].get("changes",[{}])[0].get("value",{}).get("messages",[])
-        if not msg or msg[0].get("type") != "text": return {"status":"ok"}
-        tel = msg[0].get("from","")
-        texto = msg[0].get("text",{}).get("body","")
-        if not tel or not texto: return {"status":"ok"}
-        lead = await buscar_lead(tel)
-        respuesta = respuesta_pako(texto, lead)
-        await enviar_wa(tel, respuesta)
+        entry = body.get("entry", [{}])[0]
+        changes = entry.get("changes", [{}])[0]
+        value = changes.get("value", {})
+        messages = value.get("messages", [])
+        if not messages:
+            return {"status": "ok"}
+        msg = messages[0]
+        telefono_lead = msg.get("from", "")
+        if msg.get("type") != "text":
+            return {"status": "ok"}
+        texto_lead = msg.get("text", {}).get("body", "")
+        if not texto_lead or not telefono_lead:
+            return {"status": "ok"}
+        lead = await buscar_lead_en_notion(telefono_lead)
+        respuesta = generar_respuesta_pako(texto_lead, lead)
+        await enviar_whatsapp(telefono_lead, respuesta)
         if lead.get("notion_id"):
-            await actualizar_lead(lead["notion_id"], f"[PAKO: '{texto[:80]}']")
+            await actualizar_lead_notion(lead["notion_id"], "En seguimiento", f"[PAKO: '{texto_lead[:80]}']")
     except Exception as e:
-        print(f"Error: {e}")
-    return {"status":"ok"}
+        print(f"Error PAKO: {e}")
+    return {"status": "ok"}
 
 
 @app.get("/")
 async def health():
-    return {"status": "PAKO activo", "version": "1.0"}
+    return {
+        "status": "PAKO activo",
+        "version": "1.1",
+        "agencia": "APK Cultural Exchange",
+        "notion_crm": "activo" if NOTION_ACTIVO else "pendiente",
+        "meta_wa": "configurado" if META_TOKEN and META_TOKEN != "PENDIENTE" else "pendiente",
+    }
 
 
 if __name__ == "__main__":
