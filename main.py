@@ -123,7 +123,7 @@ Mensaje: "{mensaje_lead}"
 Responde de forma calida. Pregunta su nombre si no lo menciono. Max 4 oraciones."""
 
     response = claude.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-haiku-5-5",
         max_tokens=300,
         system=PAKO_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": ctx}]
